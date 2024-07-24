@@ -31,19 +31,26 @@ import (
 	"strconv"
 	"sync"
 
-	"bitbucket.org/ausocean/iotsvc/iotds"
+	"github.com/ausocean/cloud/model"
+	"github.com/ausocean/openfish/datastore"
+)
+
+const (
+	version   = "v0.2.1"
+	projectID = "datablue"
 )
 
 var (
 	setupMutex    sync.Mutex
-	mediaStore    iotds.Store
-	settingsStore iotds.Store
+	mediaStore    datastore.Store
+	settingsStore datastore.Store
 	debug         bool
 	standalone    bool
+	storePath     string
 )
 
 func main() {
-	defaultPort := 8080
+	defaultPort := 8083
 	v := os.Getenv("PORT")
 	if v != "" {
 		i, err := strconv.Atoi(v)
@@ -58,6 +65,7 @@ func main() {
 	flag.BoolVar(&standalone, "standalone", false, "Run in standalone mode.")
 	flag.StringVar(&host, "host", "localhost", "Host we run on in standalone mode")
 	flag.IntVar(&port, "port", defaultPort, "Port we listen on in standalone mode")
+	flag.StringVar(&storePath, "filestore", "store", "File store path")
 	flag.Parse()
 
 	// Perform one-time setup.
@@ -90,7 +98,7 @@ func warmupHandler(w http.ResponseWriter, r *http.Request) {
 // test that the service is running. Devices do not use this endpoint.
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	logRequest(r)
-	w.Write([]byte("OK"))
+	w.Write([]byte(projectID + " " + version))
 }
 
 // setup executes per-instance one-time warmup and is used to
@@ -111,32 +119,32 @@ func setup(ctx context.Context) {
 	var err error
 	if standalone {
 		log.Printf("Running in standalone mode")
-		mediaStore, err = iotds.NewStore(ctx, "file", "datablue", "store")
+		mediaStore, err = datastore.NewStore(ctx, "file", "vidgrind", storePath)
 		if err == nil {
 			settingsStore = mediaStore
 			err = setupLocal(ctx, settingsStore)
 		}
 	} else {
 		log.Printf("Running in App Engine mode")
-		mediaStore, err = iotds.NewStore(ctx, "cloud", "vidgrind", "")
+		mediaStore, err = datastore.NewStore(ctx, "cloud", "vidgrind", "")
 		if err == nil {
-			settingsStore, err = iotds.NewStore(ctx, "cloud", "netreceiver", "")
+			settingsStore, err = datastore.NewStore(ctx, "cloud", "netreceiver", "")
 		}
 	}
 	if err != nil {
-		log.Fatalf("setup failed due to iotds.NewStore error: %v", err)
+		log.Fatalf("setup failed due to datastore.NewStore error: %v", err)
 	}
 
-	iotds.RegisterEntities()
+	model.RegisterEntities()
 }
 
 // setupLocal creates a local site and device for use in standalone mode.
-func setupLocal(ctx context.Context, store iotds.Store) error {
-	err := iotds.PutSite(ctx, store, &iotds.Site{Skey: 1, Name: "localhost", Enabled: true})
+func setupLocal(ctx context.Context, store datastore.Store) error {
+	err := model.PutSite(ctx, store, &model.Site{Skey: 1, Name: "localhost", Enabled: true})
 	if err != nil {
 		return err
 	}
-	err = iotds.PutDevice(ctx, store, &iotds.Device{Skey: 1, Mac: 1, Dkey: 0, Name: "localdevice", Inputs: "A0,V0,S0", MonitorPeriod: 60, Enabled: true})
+	err = model.PutDevice(ctx, store, &model.Device{Skey: 1, Mac: 1, Dkey: 0, Name: "localdevice", Inputs: "A0,V0,S0", MonitorPeriod: 60, Enabled: true})
 	return err
 }
 

@@ -32,27 +32,29 @@ import (
 	"sync"
 	"time"
 
-	"bitbucket.org/ausocean/iotsvc/iotds"
 	"github.com/ausocean/cloud/gauth"
+	"github.com/ausocean/cloud/model"
 	"github.com/ausocean/cloud/notify"
+	"github.com/ausocean/openfish/datastore"
 )
 
 const (
 	projectID          = "oceancron"
+	version            = "v0.1.3"
 	cronServiceURL     = "https://oceancron.appspot.com"
 	cronServiceAccount = "oceancron@appspot.gserviceaccount.com"
-	senderEmail        = "vidgrindservice@gmail.com"
 )
 
 var (
 	setupMutex    sync.Mutex
-	settingsStore iotds.Store
+	settingsStore datastore.Store
 	debug         bool
 	standalone    bool
 	auth          *gauth.UserAuth
 	cronScheduler *scheduler
 	cronSecret    []byte
 	notifier      notify.Notifier
+	storePath     string
 )
 
 func main() {
@@ -71,6 +73,7 @@ func main() {
 	flag.BoolVar(&standalone, "standalone", false, "Run in standalone mode.")
 	flag.StringVar(&host, "host", "localhost", "Host we run on in standalone mode")
 	flag.IntVar(&port, "port", defaultPort, "Port we listen on in standalone mode")
+	flag.StringVar(&storePath, "filestore", "store", "File store path")
 	flag.Parse()
 
 	// Perform one-time setup or bail.
@@ -94,7 +97,7 @@ func warmupHandler(w http.ResponseWriter, r *http.Request) {
 // test that the service is running. Devices do not use this endpoint.
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	logRequest(r)
-	w.Write([]byte("OK"))
+	w.Write([]byte(projectID + " " + version))
 }
 
 // setup executes per-instance one-time warmup and is used to
@@ -111,15 +114,15 @@ func setup(ctx context.Context) {
 	var err error
 	if standalone {
 		log.Printf("Running in standalone mode")
-		settingsStore, err = iotds.NewStore(ctx, "file", "vidgrind", "store")
+		settingsStore, err = datastore.NewStore(ctx, "file", "vidgrind", storePath)
 	} else {
 		log.Printf("Running in App Engine mode")
-		settingsStore, err = iotds.NewStore(ctx, "cloud", "netreceiver", "")
+		settingsStore, err = datastore.NewStore(ctx, "cloud", "netreceiver", "")
 	}
 	if err != nil {
 		log.Fatalf("could not set up datastore: %v", err)
 	}
-	iotds.RegisterEntities()
+	model.RegisterEntities()
 
 	cronSecret, err = gauth.GetHexSecret(ctx, projectID, "cronSecret")
 	if err != nil || cronSecret == nil {
@@ -131,10 +134,30 @@ func setup(ctx context.Context) {
 		log.Fatalf("could not set up cron scheduler: %v", err)
 	}
 
-	err = notifier.Init(ctx, projectID, senderEmail, &timeStore{})
+	secrets, err := gauth.GetSecrets(ctx, projectID, nil)
+	if err != nil {
+		log.Fatalf("could not get secrets: %v", err)
+	}
+	notifier, err = notify.NewMailjetNotifier(
+		notify.WithSecrets(secrets),
+		notify.WithRecipientLookup(cronRecipients),
+		notify.WithStore(notify.NewStore(settingsStore)),
+	)
 	if err != nil {
 		log.Fatalf("could not set up email notifier: %v", err)
 	}
+}
+
+// cronRecipients looks up the email address and notification period
+// for the given site. Currently, this is just the ops email
+// address. The notification kind is not currently used.
+func cronRecipients(skey int64, kind notify.Kind) ([]string, time.Duration, error) {
+	ctx := context.Background()
+	site, err := model.GetSite(ctx, settingsStore, skey)
+	if err != nil {
+		return nil, 0, fmt.Errorf("error getting site: %w", err)
+	}
+	return []string{site.OpsEmail}, time.Duration(site.NotifyPeriod) * time.Hour, nil
 }
 
 // setupCronScheduler starts a cron scheduler and loads all stored jobs.
@@ -145,7 +168,7 @@ func setupCronScheduler(ctx context.Context) error {
 		return fmt.Errorf("could not create new scheduler: %w", err)
 	}
 
-	sites, err := iotds.GetAllSites(ctx, settingsStore)
+	sites, err := model.GetAllSites(ctx, settingsStore)
 	if err != nil {
 		if sites == nil {
 			return fmt.Errorf("could not get sites for cron initialization: %v", err)
@@ -153,7 +176,7 @@ func setupCronScheduler(ctx context.Context) error {
 		log.Printf("got sites for cron initialization but encountered error: %v", err)
 	}
 	for _, site := range sites {
-		crons, err := iotds.GetCronsBySite(ctx, settingsStore, site.Skey)
+		crons, err := model.GetCronsBySite(ctx, settingsStore, site.Skey)
 		if err != nil {
 			log.Printf("failed to get crons from site=%d: %v", site.Skey, err)
 			continue
@@ -168,29 +191,6 @@ func setupCronScheduler(ctx context.Context) error {
 	}
 
 	return nil
-}
-
-// timeStore implements a notify.TimeStore that uses iotds.Variable for persistence.
-type timeStore struct {
-}
-
-// Get retrieves a notification time stored in an iotds.Variable.
-// We prepend an underscore to keep the variable private.
-func (ts *timeStore) Get(skey int64, key string) (time.Time, error) {
-	v, err := iotds.GetVariable(context.Background(), settingsStore, skey, "_"+key)
-	switch err {
-	case nil:
-		return v.Updated, nil
-	case iotds.ErrNoSuchEntity:
-		return time.Time{}, nil // We've never sent this kind of notice previously.
-	default:
-		return time.Time{}, err // Unexpected datastore error.
-	}
-}
-
-// Set updates a notification time stored in an iotds.Variable.
-func (ts *timeStore) Set(skey int64, key string, t time.Time) error {
-	return iotds.PutVariable(context.Background(), settingsStore, skey, "_"+key, "")
 }
 
 // writeError writes http errors to the response writer, in order to provide more detailed
